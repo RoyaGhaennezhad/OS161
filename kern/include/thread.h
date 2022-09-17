@@ -40,11 +40,13 @@
 #include <spinlock.h>
 #include <threadlist.h>
 
+struct addrspace;
 struct cpu;
+struct vnode;
 
 /* get machine-dependent defs */
 #include <machine/thread.h>
-
+#include <mips/trapframe.h>
 
 /* Size of kernel stacks; must be power of 2 */
 #define STACK_SIZE 4096
@@ -54,7 +56,8 @@ struct cpu;
 
 /* Macro to test if two addresses are on the same kernel stack */
 #define SAME_STACK(p1, p2)     (((p1) & STACK_MASK) == ((p2) & STACK_MASK))
-
+#define MAX_FDESC 20 // maximum file descriptor number
+#define MAX_PID 300 // max pid number
 
 /* States a thread can be in. */
 typedef enum {
@@ -104,10 +107,25 @@ struct thread {
 	/*
 	 * Public fields
 	 */
-
+	 /* add more here as needed */
+	struct File *fdesc[MAX_FDESC]; //file descriptor (make look to make an array of 20 FDs)
+	//remember to deallocate any FD's for this process
+	pid_t pid;   //pid for the process need to set it with the process descriptor table
+	pid_t ppid; //the parent PID;
 	/* add more here as needed */
 };
 
+struct wait_List{
+	struct wchan *wait_chan_exit;
+	pid_t pid;
+	int status;
+	struct wait_List *wl_next;
+};
+
+struct pid_List{
+	pid_t pid;
+	struct pid_List *next;
+};
 /*
  * Array of threads.
  */
@@ -167,6 +185,21 @@ void schedule(void);
  * timer interrupt.
  */
 void thread_consider_migration(void);
+pid_t sys_fork(struct trapframe *, int *retval);
+
+struct wait_List* alloc_wait_list(void);
+int add_wait_list( struct wait_List *node);
+int remove_wait_list(struct wait_List *node);
+struct wait_List* get_waiting_pid(pid_t pid);
+int sys__exit(int code);
+int sys_waitpid(pid_t pid, int *status, int options,int *retval);
+
+struct pid_List* alloc_pid_table(void);
+int pid_exists(pid_t pid);
+pid_t add_pid_table(void);
+int remove_pid_table(pid_t pid);
+int sys_getpid(int *retval);
+int sys_execv(const char *program, char **args, int *retval);
 
 
 #endif /* _THREAD_H_ */

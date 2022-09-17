@@ -110,6 +110,77 @@ syscall(struct trapframe *tf)
 		break;
 
 	    /* Add stuff here */
+			case SYS_fork:
+							//kprintf("\nEntering sys_fork()\n");
+			    		err = sys_fork(tf, &retval);
+							//kprintf("\nreturned from sys_fork() %d\n", retval);
+			break;
+			case SYS_execv:
+						err=sys_execv((char *)tf->tf_a0,(char **)tf->tf_a1,&retval);
+						break;
+
+	    case SYS_waitpid:
+						curthread->priority = 0;
+						//kprintf("\nEntering waitpid\n");
+						err = sys_waitpid((pid_t)tf->tf_a0,(int *) tf->tf_a1, tf->tf_a2, &retval);
+						//kprintf("\nreturned from pid %d\n", retval);
+						break;
+
+	    case SYS__exit:
+						curthread->priority = 0;
+						//kprintf("\n Entering sys__exit %d\n",curthread->pid);
+						err = sys__exit(tf->tf_a0);
+						//kprintf("\nreturned from sys_exit\n");
+ 					break;
+
+	   case SYS_open:
+					curthread->priority = 1;
+					//kprintf("\nEntering open\n");
+					err = sys_open((const_userptr_t) tf->tf_a0, tf->tf_a1, tf->tf_a2, &retval);
+					//kprintf("\nReturned from open\n");
+					break;
+
+	   case SYS_read:
+					curthread->priority = 1;
+					//kprintf("\nEntering read\n");
+					err = sys_read(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2,&retval);
+					//kprintf("\nReturned from read\n");
+					break;
+
+	   case SYS_write:
+					curthread->priority = 1;
+					//kprintf("\nEntering write\n");
+					err = sys_write(tf->tf_a0, (void *)tf->tf_a1, tf->tf_a2,&retval);
+					//kprintf("\nReturned from write\n");
+					break;
+
+	   case SYS_getpid:
+					err = sys_getpid(&retval);
+					break;
+
+	   case SYS___getcwd:
+					err = sys___getcwd((char *)tf->tf_a0, (size_t)tf->tf_a1, &retval);
+					break;
+
+	   case SYS_chdir:
+					curthread->priority = 1;
+					err = sys_chdir((char *)tf->tf_a0, &retval);
+					break;
+
+	   case SYS_close:
+					curthread->priority = 1;
+					err=sys_close(tf->tf_a0,&retval);
+					break;
+
+	   case SYS_lseek:
+					curthread->priority = 1;
+					err=sys_lseek(tf->tf_a0,tf->tf_a1,tf->tf_a2,&retval);
+					break;
+
+	   case SYS_dup2:
+					curthread->priority = 1;
+					err=sys_dup2(tf->tf_a0,tf->tf_a1,&retval);
+					break;
 
 	    default:
 		kprintf("Unknown syscall %d\n", callno);
@@ -147,15 +218,21 @@ syscall(struct trapframe *tf)
 }
 
 /*
- * Enter user mode for a newly forked process.
- *
- * This function is provided as a reminder. You need to write
- * both it and the code that calls it.
- *
- * Thus, you can trash it and do things another way if you prefer.
+* @brief run child process and set fork return value in child
+*
+*	@param[in] trap : pointer to void
+*	@param[in] dumb
+*
  */
 void
 enter_forked_process(struct trapframe *tf)
 {
-	(void)tf;
+	(void)dumb;
+	struct trapframe *tf;
+	tf = (struct trapframe *) trap;
+	// - child's fork looks success and return 0
+	tf->tf_v0 = 0;
+	tf->tf_a0 = 0;
+	tf->tf_epc = tf->tf_epc + 4; // - avoid child keep calling the fork()
+	mips_usermode(tf); // - return to user mode
 }

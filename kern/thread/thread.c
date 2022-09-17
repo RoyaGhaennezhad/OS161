@@ -66,6 +66,15 @@ DECLARRAY(cpu, static __UNUSED inline);
 DEFARRAY(cpu, static __UNUSED inline);
 static struct cpuarray allcpus;
 
+static struct lock *wait_lock;
+static struct wait_List *wait_list = NULL;
+
+static struct pid_List *pid_list = NULL;
+//static struct pid_List *exit_list = NULL;
+
+
+int switch_fl=1;//,pri_fl=0;
+
 /* Used to wait for secondary CPUs to come online. */
 static struct semaphore *cpu_startup_sem;
 
@@ -145,6 +154,14 @@ thread_create(const char *name)
 	thread->t_in_interrupt = false;
 	thread->t_curspl = IPL_HIGH;
 	thread->t_iplhigh_count = 1; /* corresponding to t_curspl */
+
+	thread->ppid = 0;
+
+	thread->pid = add_pid_table();
+
+	/* If you add to struct thread, be sure to initialize here */
+	for(int i=3; i < MAX_FILE_FILETAB; i++)
+		thread->fdesc[i] = NULL;
 
 	/* If you add to struct thread, be sure to initialize here */
 
@@ -280,6 +297,20 @@ thread_destroy(struct thread *thread)
 	/* sheer paranoia */
 	thread->t_wchan_name = "DESTROYED";
 
+	int s = splhigh();
+for(int i=3; i < MAX_FILE_FILETAB; i++)
+{
+	if(thread->fdesc[i] != NULL){
+		if(thread->fdesc[i]->vnode != NULL) {
+			if(thread->fdesc[i]->vnode->vn_opencount <= 1)
+				kfree(thread->fdesc[i]->vnode);
+			lock_destroy(thread->fdesc[i]->f_lock);
+			kfree(thread->fdesc[i]);
+		}
+	}
+}
+splx(s);
+
 	kfree(thread->t_name);
 	kfree(thread);
 }
@@ -368,6 +399,8 @@ thread_shutdown(void)
 void
 thread_bootstrap(void)
 {
+	struct cpu *bootcpu;
+	struct thread *bootthread;
 	cpuarray_init(&allcpus);
 
 	/*
@@ -381,12 +414,29 @@ thread_bootstrap(void)
 	KASSERT(CURCPU_EXISTS() == false);
 	(void)cpu_create(0);
 	KASSERT(CURCPU_EXISTS() == true);
+	bootthread = bootcpu->c_curthread;
+
+	/*
+   * Initializing curcpu and curthread is machine-dependent
+   * because either of curcpu and curthread might be defined in
+   * terms of the other.
+   */
+	INIT_CURCPU(bootcpu, bootthread);
 
 	/* cpu_create() should also have set t_proc. */
 	KASSERT(curcpu != NULL);
 	KASSERT(curthread != NULL);
 	KASSERT(curthread->t_proc != NULL);
 	KASSERT(curthread->t_proc == kproc);
+
+	/*
+	 * Now make sure both t_cpu and c_curthread are set. This
+	 * might be partially redundant with INIT_CURCPU depending on
+	 * how things are defined.
+	 */
+	curthread->t_cpu = curcpu;
+	curcpu->c_curthread = curthread;
+	curthread->pid = add_pid_table();
 
 	/* Done */
 }
@@ -528,6 +578,25 @@ thread_fork(const char *name,
 		return result;
 	}
 
+
+	int s = splhigh();
+	splx(s);
+	newthread->ppid = 0;
+
+	int result;
+	if(curthread->fdesc[0] == NULL || curthread->fdesc[1] == NULL || curthread->fdesc[2] == NULL)
+		result = fdesc_init(newthread);// initialize and open stdin ,stdout , stderr file descriptor
+	if(result)
+	{
+		panic("fdesc_init failed\n");
+	}
+
+	int i;
+  	for(i = 0; i < MAX_FILE_FILETAB; i++) {
+		if(curthread->fdesc[i] != NULL)
+    			newthread->fdesc[i] = curthread->fdesc[i]; // copy parent fdesc to child fdesc
+  	}
+
 	/*
 	 * Because new threads come out holding the cpu runqueue lock
 	 * (see notes at bottom of thread_switch), we need to account
@@ -540,6 +609,9 @@ thread_fork(const char *name,
 
 	/* Lock the current cpu's run queue and make the new thread runnable */
 	thread_make_runnable(newthread, false);
+
+	if(wait_lock == NULL)
+			wait_lock = lock_create((char*)curthread->t_name);// generate lock for current thread
 
 	return 0;
 }
@@ -969,6 +1041,7 @@ wchan_create(const char *name)
 	if (wc == NULL) {
 		return NULL;
 	}
+	spinlock_init(&wc->wc_lock);
 	threadlist_init(&wc->wc_threads);
 	wc->wc_name = name;
 
@@ -982,8 +1055,24 @@ wchan_create(const char *name)
 void
 wchan_destroy(struct wchan *wc)
 {
+	spinlock_cleanup(&wc->wc_lock);
 	threadlist_cleanup(&wc->wc_threads);
 	kfree(wc);
+}
+
+/*
+ * Lock and unlock a wait channel, respectively.
+ */
+void
+wchan_lock(struct wchan *wc)
+{
+	spinlock_acquire(&wc->wc_lock);
+}
+
+void
+wchan_unlock(struct wchan *wc)
+{
+	spinlock_release(&wc->wc_lock);
 }
 
 /*
@@ -1206,4 +1295,678 @@ interprocessor_interrupt(void)
 
 	curcpu->c_ipi_pending = 0;
 	spinlock_release(&curcpu->c_ipi_lock);
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+//  Process Function - fork(),exec()
+//
+/////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+
+/**
+* @brief duplicate the currently running process
+*
+*	@param[in] tf : pointer to trapframe structure
+*	@param[out] retval: pointer to int
+*
+* @return int
+*
+*/
+
+int
+sys_fork(struct trapframe *tf, int32_t * retval)
+{
+	struct thread *newthread;
+	lock_acquire(wait_lock);
+	newthread = thread_create(curthread->t_name); // - Creat child thread
+	lock_release(wait_lock);
+	if (newthread == NULL) {
+		return ENOMEM; /// - Sufficient virtual memory for the new process was not available
+	}
+
+
+	/* Allocate a stack from kernel heap in order to save parent trap trapframe*/
+	newthread->t_stack = (char *)kmalloc(STACK_SIZE);
+	if (newthread->t_stack == NULL) {
+		thread_destroy(newthread);
+		*retval = 1;
+		return ENOMEM; // - failed to allocate the necessary kernel structures because memory is tight
+	}
+	thread_checkstack_init(newthread);
+
+	/**
+	 * Now we clone various fields from the parent thread.
+	 */
+
+	// - Copy Thread subsystem fields from parent to child
+	newthread->t_cpu = curthread->t_cpu;
+
+
+	//kprintf("\nstack initialized process: %d\n",newthread->pid);
+
+	int s = splhigh(); // - disable interrupts
+	/* VM fields */
+	/**
+	 * do not clone address space -- let caller decide on that
+	 *
+	 * as_copy will allocate a struct addrspace and also copy the address space contents
+	 *
+	 */
+	#if OPT_DUMBVM
+		int result = as_copy(curthread->t_proc->p_addrspace, &newthread->t_proc->p_addrspace);
+	#else
+		int result = as_copy(curthread->t_proc->p_addrspace, &newthread->t_proc->p_addrspace, newthread->pid);
+	#endif
+
+	if(result) {
+		panic("\nno address space defined %d\n",result);
+		return EINVAL;
+
+	}
+
+
+	// - copy the parent trap frame so that we can access it later on
+	memcpy(&newthread->t_stack[16], tf, (sizeof(struct trapframe)));
+
+	splx(s); // - restore the old interrupt level
+
+	// - VFS fields
+	if (curthread->t_proc->p_cwd != NULL) {
+		VOP_INCREF(curthread->t_proc->p_cwd);
+		newthread->t_proc->p_cwd = curthread->t_proc->p_cwd; // copy current work directory from parent to child
+	}
+
+	//result = fdesc_init(newthread);
+	if(result) {
+		panic("fdesc_init failed\n");
+
+	}
+
+	//- copy parent file table contents to child
+	int i;
+  	for(i = 0; i < MAX_FILE_FILETAB; i++) {
+		if(curthread->fdesc[i] != NULL)
+    			newthread->fdesc[i] = curthread->fdesc[i];
+  	}
+
+  // - save parent id in child ppid
+	newthread->ppid = curthread->pid;
+
+	/**
+	 * Because new threads come out holding the cpu runqueue lock
+	 * (see notes at bottom of thread_switch), we need to account
+	 * for the spllower() that will be done releasing it.
+	 *
+	 * we used this based on thread_fork code
+	 *
+	 */
+	newthread->t_iplhigh_count++;
+
+
+	/**
+	 * Set up the switchframe so entrypoint() gets called
+	 *
+	 * switchframe_init use to initialize the switchframe of a new thread, which is
+	 * *not* the one that is currently running.
+	 *
+	 * enter_forked_process in syscall.c is the first function executed when child thread got run
+	 * see the explanation thear
+	 */
+	switchframe_init(newthread,enter_forked_process,(void *)&newthread->t_stack[16], 0);
+
+ /**
+ * Note that thread_creat will set newly created child thread runnable and try to switch to it immediately.
+ * So it's highly possible that before thread_creat returns, the child thread is already running.
+ * This is not desired since we need to copy other stuff, like file table, to child thread after thread_fork.
+ * We definitely don't want the child thread running without a file table.
+ * So we need to prevent child thread from running until parent thread set everything up.
+ * and call thread_make_runnable in last stage of this sys call .
+ *
+ */
+	/* Lock the current cpu's run queue and make the new thread runnable */
+	thread_make_runnable(newthread, false);
+
+	/*
+	 * Return new thread structure if it's wanted. Note that using
+	 * the thread structure from the parent thread should be done
+	 * only with caution, because in general the child thread
+	 * might exit at any time.
+	 */
+	*retval = newthread->pid;
+	/*if (ret != NULL) {
+		ret = newthread;
+	}*/
+
+	//kprintf("\nsys_fork: just before return\n");
+	return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////
+//
+//		Process Management Fuctions
+//
+//////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @brief allocate a pid list in prder to save our threads pids
+ *
+ * return pointer to pid_List
+ *
+ */
+struct pid_List* alloc_pid_table(){
+	struct pid_List *node;
+	node = (struct pid_List*)kmalloc(sizeof(struct pid_List *));
+	node->pid = 0;
+	node->next = NULL;
+	return node;
+}
+
+/**
+ * @brief find a pid in pid_List
+ *
+ *	@param[in] pid:
+ *
+ * return int
+ *
+ */
+int pid_exists (pid_t pid){
+	if(pid_list == NULL)
+		panic("no pid table exists\n");
+	struct pid_List *curr;
+	curr = pid_list;
+	while(curr->next != NULL)
+	{
+		if(curr->pid == pid)
+			break;
+		curr = curr->next;
+	}
+	if(curr->pid != pid)
+		return EINVAL;
+	return 0;
+}
+
+/**
+ * @brief add a pid to pid_List
+ *
+ *
+ * return pid_t
+ *
+ */
+pid_t add_pid_table(){
+
+	if(pid_list == NULL){
+		pid_list = alloc_pid_table();
+		if(pid_list == NULL)
+			return ENOMEM;
+		pid_list->pid = __PID_MIN;
+		pid_list->next = NULL;
+		return pid_list->pid;
+	}
+	struct pid_List *node;
+	struct pid_List *curr, *prev;
+	prev = pid_list;
+	curr = prev-> next;
+	while(curr != NULL)
+	{
+		if(prev->pid == curr->pid)
+			break;
+		prev = curr;
+		curr = curr->next;
+	}
+	if(prev->pid > MAX_PID)
+		return EINVAL;
+	node = alloc_pid_table();
+	if(node == NULL)
+		return ENOMEM;
+	node->pid = prev->pid+1;
+	node->next = prev->next;
+	prev->next = node;
+	return node->pid;
+}
+
+/**
+ * @brief remove a pid from pid_list
+ *
+ *	@param[in] pid:
+ *
+ * return int
+ *
+ */
+int remove_pid_table(pid_t pid){
+
+	if(pid < 2)
+		return 0;
+	if(pid_list == NULL)
+		panic("no pid table in remove\n");
+	struct pid_List *curr, *prev;
+	prev = pid_list;
+	curr = prev-> next;
+	if(curr == NULL)
+	{
+		pid_list = NULL;
+		kfree(prev);
+		return 0;
+	}
+	while(curr != NULL)
+	{
+		if(curr->pid == pid)
+			break;
+		prev = curr;
+		curr = curr->next;
+	}
+	if(curr == NULL)
+		return EINVAL;
+	prev->next=curr->next;
+	kfree(curr);
+	return 0;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
+//
+//		waitpid functions
+//
+////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @brief allocate a wait_list
+ *
+ * return struct wait_List
+ *
+ */
+struct wait_List* alloc_wait_list(){
+	struct wait_List *node;
+	node = (struct wait_List *)kmalloc(sizeof (struct wait_List *));
+	node->pid = 0;
+	node->wl_next = NULL;
+	return node;
+}
+
+/**
+ * @brief find a process in wait list
+ *
+ *	@param[in] pid:
+ *
+ * return struct wait_List
+ *
+ */
+struct wait_List* get_waiting_pid(pid_t pid){
+	if(wait_list == NULL)
+		return wait_list;
+	struct wait_List *trav;
+	trav = wait_list;
+	while(trav != NULL)
+	{
+		if(trav->pid == pid)
+			break;
+	}
+	return trav;
+}
+
+/**
+ * @brief add new node to wait list
+ *
+ *	@param[in] node: pointer to struct wait_List
+ *
+ * return struct wait_List
+ *
+ */
+int add_wait_list(struct wait_List *node){
+	if(wait_list == NULL)	{
+		return EINVAL;
+	}
+	struct wait_List *trav;
+	trav = wait_list;
+	while(trav->wl_next != NULL)
+	{
+		trav=trav->wl_next;
+	}
+	trav->wl_next = node;
+	return 0;
+}
+
+/**
+ * @brief remove a node from wait list
+ *
+ *	@param[in] node: pointer to struct wait_List
+ *
+ * return struct wait_List
+ *
+ */
+int remove_wait_list(struct wait_List *node)
+{
+	pid_t pid = node->pid;
+	if( wait_list == NULL)
+	{
+		panic("no wait list");
+		return EINVAL;
+	}
+	if(node == NULL)
+	{
+		panic("no node list");
+		return EINVAL;
+	}
+	if(wait_list == node)
+	{
+		wait_list = node->next;
+		kfree(node->wait_chan_exit);
+		kfree(node);
+		return 0;
+	}
+
+	struct wait_List *curr, *prev;
+	curr = wait_list;
+	while(curr != NULL)
+	{
+		if(curr == node && curr->pid == pid)
+		{
+			prev->wl_next = curr->wl_next;
+			kfree(curr->wait_chan_exit);
+			kfree(curr);
+			break;
+		}
+		prev = curr;
+		curr = curr->wl_next;
+	}
+	return 0;
+}
+
+/**
+* @brief open or crear file with filename
+*
+*	@param[in]  pid
+*	@param[in]  options
+*	@param[out] status
+*	@param[out] retval: pointer to int
+*
+* @return int
+*
+*/
+
+int sys_waitpid(pid_t pid, int *status, int options,int32_t *retval){
+
+	(void) options;
+	int stat;
+	int result;
+	lock_acquire(wait_lock); /// - Get the wait_lock
+	pid_t wait_pid = curthread->pid;
+	/// - copyin copies LEN bytes from a user-space address USERSRC to a kernel-space address DEST & return 0 on success
+	result = copyin((userptr_t)status,&stat,sizeof(status));
+	if(result && curthread->ppid != 0)
+	{
+		lock_release(wait_lock); /// - Free the wait_lock
+		*retval = -1;
+		return result;
+	}
+
+ /// - if process not exists
+	if(pid_exists(pid))
+	{
+		lock_release(wait_lock);
+		*retval = -1;
+		return ESRCH;
+
+	}
+
+	/// - pid named the process that is not child of current process
+ if (pid <= wait_pid){
+
+	 lock_release(wait_lock);
+	 *retval = -1;
+	 return ECHILD;
+ }
+
+ /// - status argument is invallid pointer to int in NULL
+	/*if(status == NULL)
+	{
+		lock_release(wait_lock);
+		*retval = -1;
+		return EFAULT;
+	}*/
+
+
+ /// we consider option is 0
+	if(options != 0)
+	{
+		*retval = -1;
+		lock_release(wait_lock);
+		return EINVAL;
+	}
+
+	struct wait_List *node;
+	//kprintf("\nin sys_waitpid - Hooray\n");
+	if(wait_list == NULL)
+	{
+		wait_list = alloc_wait_list();
+		wait_list->pid = pid;
+		wait_list->wait_chan_exit = wchan_create((char *)pid);
+		wchan_lock(wait_list->wait_chan_exit);
+		//kprintf("\nputting thread to sleep\n");
+		lock_release(wait_lock);
+		wchan_sleep(wait_list->wait_chan_exit);/// The current thread is suspended until awakened by someone else
+		lock_acquire(wait_lock);
+	}
+	else{
+		//node = get_waiting_pid(pid);
+		node = alloc_wait_list();
+		node->pid = pid;
+		node->wait_chan_exit = wchan_create((char*) pid);
+		add_wait_list(node);
+		wchan_lock(node->wait_chan_exit);
+		//kprintf("\nputting thread to sleep\n");
+		lock_release(wait_lock);
+		wchan_sleep(node->wait_chan_exit); /// The current thread is suspended until awakened by someone else
+		lock_acquire(wait_lock);
+		if(node->status != stat)
+		{
+			*status = -1;
+		}
+		else
+		{
+			*status = stat;
+		}
+
+		//kprintf("\nAfter the wake up has happened\n");
+	}
+	remove_wait_list(node);
+	*retval = pid;
+	lock_release(wait_lock);
+	return 0;
+}
+
+/**
+* @brief terminate process
+*
+*	@param[out] code : exite code
+*
+* @return int \b return 0 on success
+*
+*/
+int sys__exit(int code) {
+
+	pid_t pid = curthread->pid;
+	lock_acquire(wait_lock);
+	struct wait_List* node;
+	//int s;
+	(void)code = _MKWAIT_EXIT(code); // generate real exite code with this macro
+
+	node = wait_list;
+	while(node != NULL) /// - Is the process in waiting list?
+	{
+		if(node->pid == pid)
+		{
+			node->status = code; // the exite code reported back to processes called waitpid()
+	        	//wake up all sleeping threads
+	        	//splx(s);
+	        	wchan_wakeall(node->wait_chan_exit);
+		}
+		node = node->wl_next;
+  }
+	if(curthread->pid > 1)
+		remove_pid_table(curthread->pid); /// Release process id
+	lock_release(wait_lock);
+	//kprintf("\n Thread exitted %d\n", curthread->pid);
+  	thread_exit(); /// - exit frome process
+
+	return 0;
+}
+
+/**
+* @brief execute a program
+*
+*	@param[in]  progname : pointer to char
+*	@param[in]  args 		 : pointer  to pointer to char
+*	@param[out] retval
+*
+* @return int \b return 0 on success
+*
+*/
+int
+sys_execv(const char *progname, char **args, int *retval)
+{
+	struct vnode *v;
+	vaddr_t entrypoint, stackptr;
+	int result;
+
+	if(progname == NULL)
+	{
+		*retval = -1;
+		return EFAULT;
+	}
+
+	char *fname = (char *)kmalloc(PATH_MAX);
+	size_t size;
+	copyinstr((userptr_t)progname,fname,PATH_MAX,&size);
+
+	int i = 0;
+	while(args[i] != NULL)
+  		i++;
+  	int argc = i;
+
+	char **argv;
+	argv = (char **)kmalloc(sizeof(char*));
+
+	// Copy in all the argumens in args
+	size_t arglen;
+	for(i = 0; i < argc; i++) {
+		int len = strlen(args[i]);
+		len++;
+		argv[i]=(char*)kmalloc(len);
+		copyinstr((userptr_t)args[i], argv[i], len, &arglen);
+  	}
+  	//Null terminate argv
+  	argv[argc] = NULL;
+
+
+	/* Open the file. */
+	result = vfs_open(fname, O_RDONLY, 0, &v);
+	if (result) {
+		*retval = -1;
+		return result;
+	}
+	//destroy the address space for a new loadelf
+	if(curthread->t_proc->t_addrspace != NULL)
+	{
+		as_destroy(curthread->t_proc->t_addrspace);
+		curthread->t_proc->t_addrspace=NULL;
+	}
+	/* We should be a new thread. */
+	KASSERT(curthread->t_proc->t_addrspace == NULL);
+
+	/* Create a new address space. */
+	curthread->t_proc->t_addrspace = as_create();
+	if (curthread->t_proc->t_addrspace==NULL) {
+		vfs_close(v);
+		*retval = -1;
+		return ENOMEM;
+	}
+
+	/* Activate it. */
+	as_activate(curthread->t_proc->t_addrspace);
+
+	/* Load the executable. */
+	result = load_elf(v, &entrypoint);
+	if (result) {
+		/* thread_exit destroys curthread->t_proc->t_addrspace */
+		vfs_close(v);
+		*retval = -1;
+		return result;
+	}
+
+	/* Done with the file now. */
+	vfs_close(v);
+
+	/* Define the user stack in the address space */
+	result = as_define_stack(curthread->t_proc->t_addrspace, &stackptr);
+	if (result) {
+		/* thread_exit destroys curthread->t_proc->t_addrspace */
+		*retval = -1;
+		return result;
+	}
+
+	//set up the arguments in the user stack
+
+
+
+	//copy the parameter to stack
+	unsigned int pstack[argc];
+  size_t arglen;
+	for(i = argc-1; i >= 0; i--) {
+		int len = strlen(argv[i]);
+		int shift = (len%4);
+		if(shift == 0)
+			shift = 4;
+		stackptr = stackptr - (len + shift);
+		copyoutstr(argv[i], (userptr_t)stackptr, len, &arglen);
+		pstack[i] = stackptr;
+	}
+
+	pstack[argc] = (int)NULL;
+	/*save address of each paraeter in stak*/
+	for(i = argc-1; i >= 0; i--)
+	{
+		stackptr = stackptr - 4;
+		copyout(&pstack[i] ,(userptr_t)stackptr, sizeof(pstack[i]));
+	}
+	//kprintf("in execv: %s",(char *)stackptr_ptr+4);
+	//null terminate stack
+	//int term = 0;
+	//memcpy((userptr_t)stackptr_trav, &term, sizeof(term));
+	//memcpy((userptr_t)stackptr_ptr, &term, sizeof(term));
+
+	/**
+   * @breif DEBUG() is for conditionally printing debug messages to the console.
+	*/
+	DEBUG(DB_EXEC, "DEBUG EXEC %s", progname);
+	//args = pt;
+	//copyout(pt,(userptr_t)stackptr,sizeof(pt));
+
+	*retval = 0;
+	kfree(argv);
+	/* Warp to user mode. */
+	enter_new_process(argc /*argc*/, (userptr_t)stackptr /*userspace addr of argv*/,
+			  stackptr, entrypoint);
+
+		/* enter_new_process does not return. */
+	panic("enter_new_process returned\n");
+
+	return EINVAL;
+}
+
+/**
+* @brief get the current process ID
+*
+*	@param[out] retval: pointer to int
+*
+* @return int
+*				/b 0 on success
+*
+*/
+int sys_getpid(int *retval) {
+	*retval = (int)curthread->pid;
+	return 0;
 }
